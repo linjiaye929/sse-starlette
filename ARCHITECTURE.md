@@ -79,8 +79,19 @@ _stream_response         _ping        _exit_signal    _disconnect
    CANCEL <----------------+----- CANCEL <-+
       |
       v
-  Task group exits (generator receives CancelledError)
+  Task group exits after generator cleanup
 ```
+
+Cancellation reaches the generator directly when `_stream_response` is awaiting
+`__anext__()`. If cancellation instead interrupts the data send, the generator is
+already suspended at `yield`, so `_stream_response` explicitly calls `aclose()`.
+That close is shielded from cancellation so asynchronous `finally` blocks can
+finish. After successful cleanup, the original cancellation is re-raised; errors
+from `aclose()` propagate. Cancellation cleanup has no separate deadline, so
+`aclose()` must finish cooperatively. No close runs concurrently with
+`__anext__()`. This does not enter a generator that has never started.
+Cleanup after `SendTimeoutError` remains unshielded: a later outer cancellation
+can still interrupt it.
 
 ---
 

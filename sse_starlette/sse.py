@@ -383,6 +383,17 @@ class EventSourceResponse(Response):
                 if aclose is not None:
                     await aclose()
                 raise
+            except anyio.get_cancelled_exc_class():
+                # Cancellation during send does not reach a generator suspended
+                # at yield. We own the iterator here (no __anext__ is running),
+                # so close it explicitly. After successful async cleanup,
+                # re-raise the original cancellation. Timeout cleanup above
+                # remains interruptible by a later cancellation.
+                aclose = getattr(self.body_iterator, "aclose", None)
+                if aclose is not None:
+                    with anyio.CancelScope(shield=True):
+                        await aclose()
+                raise
 
         async with self._send_lock:
             self.active = False

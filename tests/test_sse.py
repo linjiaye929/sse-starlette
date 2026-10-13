@@ -167,6 +167,206 @@ class TestEventSourceResponse:
                     assert "Disconnected from client" in caplog.text
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize("async_cleanup", [False, True])
+    async def test_disconnect_whenDataSendBlocked_thenClosesStartedGenerator(
+        self, async_cleanup
+    ):
+        send_started = anyio.Event()
+        cleanup_count = 0
+
+        async def event_publisher():
+            nonlocal cleanup_count
+            try:
+                yield {"data": "first event"}
+                pytest.fail("Disconnected streams must not resume iteration")
+            finally:
+                if async_cleanup:
+                    await anyio.lowlevel.checkpoint()
+                cleanup_count += 1
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                send_started.set()
+                await anyio.sleep_forever()
+
+        async def receive():
+            await send_started.wait()
+            return {"type": "http.disconnect"}
+
+        # Keep both references alive: cleanup must not depend on garbage collection.
+        generator = event_publisher()
+        response = EventSourceResponse(generator, ping=0)
+        try:
+            with anyio.fail_after(5):
+                await response(
+                    {"type": "http", "method": "GET", "headers": []}, receive, send
+                )
+            assert cleanup_count == 1
+        finally:
+            await generator.aclose()
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "termination", ["disconnect", "timeout", "send_error", "exhausted", "next"]
+    )
+    async def test_streamCleanup_whenTerminated_thenPreservesIteratorOwnership(
+        self, termination
+    ):
+        send_started = anyio.Event()
+        next_started = anyio.Event()
+        send_cancellation = None
+        stream_error = None
+        send_error = OSError("send failed")
+
+        class Iterator:
+            next_calls = 0
+            close_calls = 0
+            cancelled_next = 0
+            running = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self.running = True
+                self.next_calls += 1
+                try:
+                    if self.next_calls == 1:
+                        return {"data": "first event"}
+                    if termination == "next":
+                        next_started.set()
+                        try:
+                            await anyio.sleep_forever()
+                        except anyio.get_cancelled_exc_class():
+                            self.cancelled_next += 1
+                            raise
+                    raise StopAsyncIteration
+                finally:
+                    self.running = False
+
+            async def aclose(self):
+                assert not self.running, "Never close a running iterator"
+                self.close_calls += 1
+                assert self.close_calls == 1, "Never close the iterator twice"
+                await anyio.lowlevel.checkpoint()
+
+        class RecordingResponse(EventSourceResponse):
+            async def _stream_response(self, send):
+                nonlocal stream_error
+                try:
+                    await super()._stream_response(send)
+                except BaseException as exc:
+                    stream_error = exc
+                    raise
+
+        async def send(message):
+            nonlocal send_cancellation
+            if message["type"] != "http.response.body" or not message["more_body"]:
+                return
+            send_started.set()
+            if termination == "send_error":
+                raise send_error
+            if termination in ("disconnect", "timeout"):
+                try:
+                    await anyio.sleep_forever()
+                except anyio.get_cancelled_exc_class() as exc:
+                    send_cancellation = exc
+                    raise
+
+        async def receive():
+            if termination == "disconnect":
+                await send_started.wait()
+            elif termination == "next":
+                await next_started.wait()
+            else:
+                await anyio.sleep_forever()
+            return {"type": "http.disconnect"}
+
+        iterator = Iterator()
+        response = RecordingResponse(
+            iterator, ping=0, send_timeout=0.01 if termination == "timeout" else None
+        )
+        scope = {"type": "http", "method": "GET", "headers": []}
+        with anyio.fail_after(5):
+            if termination in ("timeout", "send_error"):
+                error_type = SendTimeoutError if termination == "timeout" else OSError
+                with pytest.raises(error_type) as exc_info:
+                    await response(scope, receive, send)
+                assert exc_info.value is stream_error
+                if termination == "send_error":
+                    assert exc_info.value is send_error
+            else:
+                await response(scope, receive, send)
+
+        assert iterator.close_calls == int(termination in ("disconnect", "timeout"))
+        assert iterator.cancelled_next == int(termination == "next")
+        if termination == "disconnect":
+            assert stream_error is send_cancellation
+
+    @pytest.mark.anyio
+    async def test_sendTimeout_whenCleanupCancelled_thenHonorsOuterCancellation(self):
+        close_started = anyio.Event()
+        release_close = anyio.Event()
+        response_finished = anyio.Event()
+        cleanup_cancelled = False
+        cleanup_finished = False
+        response_errors = []
+
+        async def event_publisher():
+            nonlocal cleanup_cancelled, cleanup_finished
+            try:
+                yield {"data": "first event"}
+            finally:
+                close_started.set()
+                try:
+                    await release_close.wait()
+                except anyio.get_cancelled_exc_class():
+                    cleanup_cancelled = True
+                    raise
+                cleanup_finished = True
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                await anyio.sleep_forever()
+
+        async def receive():
+            await anyio.sleep_forever()
+
+        generator = event_publisher()
+        response = EventSourceResponse(generator, ping=0, send_timeout=0.01)
+
+        async def run_response(task_status=anyio.TASK_STATUS_IGNORED):
+            with anyio.CancelScope() as cancel_scope:
+                task_status.started(cancel_scope)
+                try:
+                    await response(
+                        {"type": "http", "method": "GET", "headers": []},
+                        receive,
+                        send,
+                    )
+                except BaseException as exc:
+                    response_errors.append(exc)
+            response_finished.set()
+
+        async with anyio.create_task_group() as task_group:
+            try:
+                cancel_scope = await task_group.start(run_response)
+                # The watchdog bounds a broken implementation, not an elapsed-time
+                # assertion: cancellation must finish before cleanup is released.
+                with anyio.fail_after(5):
+                    await close_started.wait()
+                    cancel_scope.cancel()
+                    await response_finished.wait()
+                assert cleanup_cancelled
+                assert not cleanup_finished
+                assert not release_close.is_set()
+                assert len(response_errors) == 1
+                assert isinstance(response_errors[0], anyio.get_cancelled_exc_class())
+            finally:
+                release_close.set()
+        await generator.aclose()
+
+    @pytest.mark.anyio
     async def test_send_whenTimeoutOccurs_thenRaisesSendTimeoutError(self):
         # Arrange
         # Send timeout is set to 0.5s, but `send` will take 1s. Expect SendTimeoutError.
